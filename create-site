@@ -1,0 +1,149 @@
+#!/bin/sh
+#
+# @file Helper script for creating sites for gitlab omnibus.
+#
+# Run with root user.
+#
+# Written for a specific use-case:
+# - gitlab-ee omnibus installed via apt-get
+# - custom folder "/etc/gitlab/nginx" with "sites-available" and "sites-enabled" folders
+# - gitlab.rb containing the following:
+#       nginx['enable'] = true
+#       nginx['custom_nginx_config'] = "include /etc/gitlab/nginx/sites-enabled/*.conf;"
+#       nginx['http2_enabled'] = true
+# - sites run with docker and expose a single port
+# - sites reside in /home/devel/sites/<domain name> folder
+#
+
+# Print usage message.
+print_usage_message() {
+    echo "Usage"
+    echo ""
+    echo "create-site <domain name> <port number>"
+    echo ""
+    echo "E.g"
+    echo "\tcreate-site my-site.example.com 14000"
+    echo "\tcreate-site api.site.example.com 8080"
+    echo ""
+    echo "Parameters"
+    echo "\t<domain name>\t the name of the domain, e.g my-site.example.com"
+    echo "\t<port number>\t a positive integer number, e.g 14000"
+}
+
+# Print the message and exit.
+print_message_and_exit() {
+    echo "${1}"
+    exit 1
+}
+
+# Generate config in sites-available.
+gen_initial_config() {
+    echo ""
+    echo "Target config file is '${TARGET_CONFIG_FILE}'"
+
+    if [ -f "${TARGET_CONFIG_FILE}" ]
+    then
+        print_message_and_exit "\tERROR: The file already exists."
+    fi
+
+    sed --quiet "s/{{ DOMAIN_NAME }}/${DOMAIN}/g; s/{{ PORT_NUMBER }}/${PORT}/g;w ${TARGET_CONFIG_FILE}" "${SCRIPT_DIR}/site-template.conf" \
+        || print_message_and_exit "\tERROR: The file could not be generated."
+
+    echo "\tSUCCESS: File has been generated."
+}
+
+# Generate symlink from sites-available to sites-enabled.
+gen_symlink() {
+    echo ""
+    echo "Creating symlink for the ${TARGET_CONFIG_FILE}"
+
+    # Trailing slash is important for second param!
+    ln -s "${TARGET_CONFIG_FILE}" "${SITES_ENABLED_DIR}/" \
+        || print_message_and_exit "\tERROR: The symlink could not be created."
+
+    echo "\tSUCCESS: Symlink created."
+}
+
+# Check nginx config.
+test_nginx() {
+   echo ""
+   echo -n "Testing nginx config.. "
+
+    /opt/gitlab/embedded/sbin/nginx -p /var/opt/gitlab/nginx -t \
+        || print_message_and_exit "FAIL"
+
+    echo "OK"
+}
+
+# Reload nginx.
+reload_nginx() {
+    echo ""
+    echo -n "Reloading nginx.."
+
+    /opt/gitlab/embedded/sbin/nginx -p /var/opt/gitlab/nginx -s reload \
+        || print_message_and_exit "FAIL"
+
+    echo "OK"
+}
+
+# Generate let's encrypt certificates.
+gen_letsencrypt_certs() {
+    echo ""
+    echo "Generating certificates with Let's Encrypt.."
+
+    certbot certonly --webroot -w /var/www/_letsencrypt/ -d "${DOMAIN}" \
+        || print_message_and_exit "FAIL"
+
+    echo "OK"
+}
+
+# Enable cert lines in the nginx config.
+enable_certs() {
+    echo ""
+
+    # @todo: Sed
+    echo -n "Enabling Let's Encrypt certs.."
+
+    sed -i "s/#ssl/ssl/g" "${TARGET_CONFIG_FILE}" \
+        || print_message_and_exit "FAIL"
+
+    echo "OK"
+}
+
+if [ -z "${1}" ]
+then
+    print_usage_message
+
+    exit 1
+fi
+
+if [ -z "${2}" ] && [ "${2}" -le 0 ]
+then
+    print_usage_message
+
+    exit 1
+fi
+
+DOMAIN="${1}"
+PORT="${2}"
+
+SCRIPT=$(readlink -f "${0}")
+SCRIPT_DIR=$(dirname "$SCRIPT")
+
+echo "Generating nginx config for '${DOMAIN}' at port '${PORT}'.."
+
+NGINX_CONFIG_BASE_DIR="/etc/gitlab/nginx"
+
+CONFIG_NAME="${DOMAIN}.conf"
+SITES_AVAILABLE_DIR="${NGINX_CONFIG_BASE_DIR}/sites-available"
+SITES_ENABLED_DIR="${NGINX_CONFIG_BASE_DIR}/sites-enabled"
+TARGET_CONFIG_FILE="${SITES_AVAILABLE_DIR}/${CONFIG_NAME}"
+
+gen_initial_config
+gen_symlink
+test_nginx
+reload_nginx
+gen_letsencrypt_certs
+enable_certs
+test_nginx
+reload_nginx
